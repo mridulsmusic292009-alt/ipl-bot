@@ -690,7 +690,11 @@ async def on_ready():
 
     try:
         GUILD_ID = 1459211477268299938
-        synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
+        guild = discord.Object(id=GUILD_ID)
+
+        tree.copy_global_to(guild=guild)
+        synced = await tree.sync(guild=guild)
+
         print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
         for cmd in synced:
             print(f"  /{cmd.name}")
@@ -699,6 +703,7 @@ async def on_ready():
 
     client.loop.create_task(scheduler())
     client.loop.create_task(result_loop())
+
 
 # ===== RUN =====
 keep_alive()
