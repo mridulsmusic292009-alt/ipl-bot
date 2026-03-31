@@ -364,7 +364,8 @@ async def process_results(force=False, match_id=None):
             skipped.append((mid, "No result after 7 hours"))
             continue
 
-        if force or (mt + timedelta(hours=3, minutes=30) <= now <= mt + timedelta(hours=7)):
+        if force or (mt + timedelta(hours=4) <= now <= mt + timedelta(hours=7)):
+
             pending.append((mid, m))
         else:
             skipped.append((mid, "Result window has not opened yet"))
