@@ -42,6 +42,17 @@ def get_user(data, uid):
 def is_admin(uid): return uid == ADMIN_ID
 def is_banned(data, uid): return str(uid) in data.get("banned_users", [])
 
+def is_betting_open(match):
+    """Betting is open from card post time until 15 mins after match starts."""
+    if match.get("status") != "upcoming":
+        return False
+    mt = datetime.fromisoformat(match["time"])
+    now = datetime.now(IST)
+    # mt is already timezone-aware (IST), make sure now is too
+    if mt.tzinfo is None:
+        mt = IST.localize(mt)
+    return now <= mt + timedelta(minutes=15)
+
 # ===== TEAM NAME MAPPING =====
 TEAM_MAP = {
     "Royal Challengers Bengaluru": "RCB",
@@ -117,12 +128,23 @@ class ConfirmView(discord.ui.View):
     @discord.ui.button(label="✅ Confirm Bet", style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, btn: discord.ui.Button):
         data = load_db()
+
         if is_banned(data, interaction.user.id):
-            return await interaction.response.edit_message(content="🚫 You are banned from betting.", view=None)
+            return await interaction.response.edit_message(
+                content="🚫 You are banned from betting.", view=None
+            )
+
+        match = data["matches"].get(self.mid, {})
+        if not is_betting_open(match):
+            return await interaction.response.edit_message(
+                content="⏰ Betting is now closed for this match.", view=None
+            )
 
         u = get_user(data, interaction.user.id)
         if self.amt > u["coins"]:
-            return await interaction.response.edit_message(content="❌ Not enough coins.", view=None)
+            return await interaction.response.edit_message(
+                content=f"❌ Not enough coins. You have **{u['coins']}** coins.", view=None
+            )
 
         u["coins"] -= self.amt
         u["bets"] += 1
@@ -134,12 +156,18 @@ class ConfirmView(discord.ui.View):
         })
         save_db(data)
         await interaction.response.edit_message(
-            content=f"✅ Bet of **{self.amt}** coins on **{self.team}** placed!", view=None
+            content=f"✅ Bet of **{self.amt}** coins on **{self.team}** placed! Good luck! 🏏",
+            view=None
         )
 
 
 class BetModal(discord.ui.Modal, title="Place Your Bet"):
-    amount = discord.ui.TextInput(label="Enter Amount (100 - 5000)", placeholder="e.g. 500")
+    amount = discord.ui.TextInput(
+        label="Enter Amount (100 - 5000)",
+        placeholder="e.g. 500",
+        min_length=1,
+        max_length=4
+    )
 
     def __init__(self, mid, team):
         super().__init__()
@@ -150,17 +178,29 @@ class BetModal(discord.ui.Modal, title="Place Your Bet"):
         data = load_db()
 
         if is_banned(data, interaction.user.id):
-            return await interaction.response.send_message("🚫 You are banned from betting.", ephemeral=True)
+            return await interaction.response.send_message(
+                "🚫 You are banned from betting.", ephemeral=True
+            )
+
+        match = data["matches"].get(self.mid, {})
+        if not is_betting_open(match):
+            return await interaction.response.send_message(
+                "⏰ Betting is now closed for this match.", ephemeral=True
+            )
 
         u = get_user(data, interaction.user.id)
 
         try:
             amt = int(self.amount.value)
         except ValueError:
-            return await interaction.response.send_message("❌ Invalid amount. Enter a number.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Invalid amount. Please enter a number.", ephemeral=True
+            )
 
         if amt < 100 or amt > 5000:
-            return await interaction.response.send_message("❌ Amount must be between 100 and 5000.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Amount must be between **100** and **5000** coins.", ephemeral=True
+            )
 
         if amt > u["coins"]:
             return await interaction.response.send_message(
@@ -180,16 +220,30 @@ class BetView(discord.ui.View):
         self.mid = mid
         self.t1 = t1
         self.t2 = t2
+        # Set actual team names on buttons
+        self.children[0].label = f"🏏 {t1}"
+        self.children[1].label = f"🏏 {t2}"
 
     @discord.ui.button(label="Team 1", style=discord.ButtonStyle.primary)
     async def b1(self, interaction: discord.Interaction, btn: discord.ui.Button):
-        self.b1.label = self.t1
+        data = load_db()
+        match = data["matches"].get(self.mid, {})
+        if not is_betting_open(match):
+            return await interaction.response.send_message(
+                "⏰ Betting is now closed for this match.", ephemeral=True
+            )
         await interaction.response.send_modal(BetModal(self.mid, self.t1))
 
     @discord.ui.button(label="Team 2", style=discord.ButtonStyle.success)
     async def b2(self, interaction: discord.Interaction, btn: discord.ui.Button):
-        self.b2.label = self.t2
+        data = load_db()
+        match = data["matches"].get(self.mid, {})
+        if not is_betting_open(match):
+            return await interaction.response.send_message(
+                "⏰ Betting is now closed for this match.", ephemeral=True
+            )
         await interaction.response.send_modal(BetModal(self.mid, self.t2))
+
 
 # ===== AUTO MATCH POST =====
 async def scheduler():
@@ -198,39 +252,75 @@ async def scheduler():
         data = load_db()
         ch = client.get_channel(CHANNEL_ID)
         now = datetime.now(IST)
+        schedule = get_schedule()
 
-        for idx, (d, t1, t2, tm) in enumerate(get_schedule()):
+        for idx, (d, t1, t2, tm) in enumerate(schedule):
             mt = IST.localize(datetime.strptime(f"{d} {tm}", "%Y-%m-%d %H:%M"))
             mid = f"M{idx}"
 
+            # Post card 3 hours before match, within a 5 min window
             if mt - timedelta(hours=3) <= now <= mt - timedelta(hours=2, minutes=55):
                 if mid not in data["matches"]:
+                    # Figure out match number for this day
+                    match_date = d
+                    day_matches = [(i, x) for i, x in enumerate(schedule) if x[0] == match_date]
+                    match_num = next(i+1 for i, (gi, x) in enumerate(day_matches) if gi == idx)
+                    total_day = len(day_matches)
+
                     embed = discord.Embed(
-                        title="🏏 IPL Match Betting Open!",
-                        description=f"**{t1}** vs **{t2}**",
+                        title=f"🏏 IPL 2026 — Match #{idx+1}",
+                        description=f"# {t1}  🆚  {t2}",
                         color=discord.Color.orange()
                     )
-                    embed.add_field(name="⏰ Start Time", value=mt.strftime("%I:%M %p IST"))
-                    embed.add_field(name="💰 Bet Range", value="100 – 5000 coins")
-                    embed.set_footer(text="Click a button below to place your bet!")
+                    embed.add_field(
+                        name="📅 Date",
+                        value=datetime.strptime(d, "%Y-%m-%d").strftime("%B %d, %Y"),
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="⏰ Start Time",
+                        value=mt.strftime("%I:%M %p IST"),
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="💰 Bet Range",
+                        value="100 – 5,000 coins",
+                        inline=True
+                    )
+                    if total_day == 2:
+                        embed.add_field(
+                            name="📌 Note",
+                            value=f"Match {match_num} of 2 today",
+                            inline=False
+                        )
+                    embed.add_field(
+                        name="⚡ Payout",
+                        value="Win = **2x** your bet",
+                        inline=True
+                    )
+                    embed.set_footer(
+                        text=f"⏳ Betting open until 15 mins after match starts ({(mt + timedelta(minutes=15)).strftime('%I:%M %p IST')})"
+                    )
 
                     view = BetView(mid, t1, t2)
-                    view.b1.label = t1
-                    view.b2.label = t2
-
                     await ch.send(embed=embed, view=view)
+
                     data["matches"][mid] = {
-                        "team1": t1, "team2": t2,
+                        "team1": t1,
+                        "team2": t2,
                         "time": mt.isoformat(),
                         "status": "upcoming",
                         "winner": None
                     }
                     save_db(data)
+                    print(f"[SCHEDULER] Posted match card: {t1} vs {t2}")
 
         await discord.utils.sleep_until(now + timedelta(minutes=5))
 
+
 # ===== RESULT SYSTEM =====
 def get_winner(t1, t2):
+    """Fetch winner from CricAPI and normalize to short code."""
     try:
         r = requests.get(
             f"https://api.cricapi.com/v1/currentMatches?apikey={CRICKET_API_KEY}",
@@ -243,8 +333,9 @@ def get_winner(t1, t2):
                 if raw_winner:
                     return normalize_team(raw_winner)
     except Exception as e:
-        print(f"API error: {e}")
+        print(f"[API ERROR] {e}")
     return None
+
 
 async def result_loop():
     await client.wait_until_ready()
@@ -256,11 +347,19 @@ async def result_loop():
         for mid, m in data["matches"].items():
             if m["status"] != "upcoming":
                 continue
-            mt = datetime.fromisoformat(m["time"])
 
-            if now >= mt + timedelta(hours=4):
+            mt = datetime.fromisoformat(m["time"])
+            if mt.tzinfo is None:
+                mt = IST.localize(mt)
+
+            # Only call API between 4 and 6 hours after match start
+            # This limits API usage to ~8 calls per match max
+            if mt + timedelta(hours=4) <= now <= mt + timedelta(hours=6):
+                print(f"[RESULT] Checking winner for {m['team1']} vs {m['team2']}")
                 winner = get_winner(m["team1"], m["team2"])
+
                 if not winner:
+                    print(f"[RESULT] No winner yet for {m['team1']} vs {m['team2']}")
                     continue
 
                 winners = []
@@ -272,22 +371,46 @@ async def result_loop():
                         u["wins"] += 1
                         winners.append((b["user"], coins))
 
-                msg = f"🏆 Match result: **{m['team1']} vs {m['team2']}**\n🥇 Winner: **{winner}**\n\n"
-                for idx, (uid, amt) in enumerate(winners[:3]):
-                    msg += f"{['🥇','🥈','🥉'][idx]} <@{uid}> +{amt} coins\n"
+                # Build result announcement
+                embed = discord.Embed(
+                    title="🏆 Match Result",
+                    description=f"**{m['team1']}** vs **{m['team2']}**",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="🥇 Winner", value=f"**{winner}**", inline=False)
 
-                await ch.send(msg)
+                if winners:
+                    top = ""
+                    for idx, (uid, amt) in enumerate(winners[:3]):
+                        top += f"{['🥇','🥈','🥉'][idx]} <@{uid}> +{amt} coins\n"
+                    embed.add_field(name="🎉 Top Winners", value=top, inline=False)
+                else:
+                    embed.add_field(name="😔 No Winners", value="Nobody bet on the winning team.", inline=False)
+
+                await ch.send(embed=embed)
                 m["status"] = "done"
                 m["winner"] = winner
                 save_db(data)
+                print(f"[RESULT] Winner saved: {winner}")
 
-        await discord.utils.sleep_until(now + timedelta(minutes=5))
+            # If 6 hours passed and still no winner, mark as no result
+            elif now > mt + timedelta(hours=6) and m["status"] == "upcoming":
+                print(f"[RESULT] No result found after 6hrs for {m['team1']} vs {m['team2']} — marking done")
+                m["status"] = "done"
+                m["winner"] = None
+                save_db(data)
+
+        # Check every 15 minutes to save API calls
+        await discord.utils.sleep_until(now + timedelta(minutes=15))
+
 
 # ===== USER COMMANDS =====
 @tree.command(name="balance", description="Check your current coin balance")
 async def balance(interaction: discord.Interaction):
     u = get_user(load_db(), interaction.user.id)
-    await interaction.response.send_message(f"💰 You have **{u['coins']}** coins.", ephemeral=True)
+    await interaction.response.send_message(
+        f"💰 You have **{u['coins']}** coins.", ephemeral=True
+    )
 
 
 @tree.command(name="leaderboard", description="View the top 3 richest users")
@@ -296,7 +419,7 @@ async def leaderboard(interaction: discord.Interaction):
     users = sorted(data["users"].items(), key=lambda x: x[1]["coins"], reverse=True)
     msg = "🏆 **Leaderboard**\n\n"
     for idx, (uid, u) in enumerate(users[:3]):
-        msg += f"{['🥇','🥈','🥉'][idx]} <@{uid}> — {u['coins']} coins\n"
+        msg += f"{['🥇','🥈','🥉'][idx]} <@{uid}> — **{u['coins']}** coins\n"
     await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -314,7 +437,12 @@ async def history(interaction: discord.Interaction):
                 t2 = match.get("team2", "?")
                 if match.get("status") == "done":
                     stored_winner = match.get("winner")
-                    status = "✅ Won" if stored_winner and bet["team"] == stored_winner else "❌ Lost"
+                    if stored_winner is None:
+                        status = "🚫 No Result"
+                    elif bet["team"] == stored_winner:
+                        status = "✅ Won"
+                    else:
+                        status = "❌ Lost"
                 else:
                     status = "⏳ Pending"
                 msg += f"**{t1} vs {t2}** | {bet['team']} | {bet['amount']} coins | {status}\n"
@@ -323,7 +451,10 @@ async def history(interaction: discord.Interaction):
 
 @tree.command(name="help", description="Show all available commands")
 async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(title="📖 IPL Betting Bot — Help", color=discord.Color.blue())
+    embed = discord.Embed(
+        title="📖 IPL Betting Bot — Help",
+        color=discord.Color.blue()
+    )
     embed.add_field(
         name="👤 User Commands",
         value=(
@@ -349,8 +480,9 @@ async def help_cmd(interaction: discord.Interaction):
         ),
         inline=False
     )
-    embed.set_footer(text="Bet range: 100–5000 coins  |  Starting balance: 10,000 coins")
+    embed.set_footer(text="Bet range: 100–5,000 coins  |  Starting balance: 10,000 coins  |  Win = 2x payout")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 # ===== ADMIN COMMANDS =====
 @tree.command(name="setbalance", description="Set a user's coin balance to an exact value")
@@ -360,7 +492,9 @@ async def setbalance(interaction: discord.Interaction, user: discord.Member, amo
     data = load_db()
     get_user(data, user.id)["coins"] = amount
     save_db(data)
-    await interaction.response.send_message(f"✅ Set **{user.name}**'s balance to {amount} coins.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Set **{user.name}**'s balance to **{amount}** coins.", ephemeral=True
+    )
 
 
 @tree.command(name="addbalance", description="Add coins to a user's balance")
@@ -370,7 +504,9 @@ async def addbalance(interaction: discord.Interaction, user: discord.Member, amo
     data = load_db()
     get_user(data, user.id)["coins"] += amount
     save_db(data)
-    await interaction.response.send_message(f"✅ Added {amount} coins to **{user.name}**.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Added **{amount}** coins to **{user.name}**.", ephemeral=True
+    )
 
 
 @tree.command(name="removebalance", description="Remove coins from a user's balance")
@@ -381,7 +517,9 @@ async def removebalance(interaction: discord.Interaction, user: discord.Member, 
     u = get_user(data, user.id)
     u["coins"] = max(0, u["coins"] - amount)
     save_db(data)
-    await interaction.response.send_message(f"✅ Removed {amount} coins from **{user.name}**.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Removed **{amount}** coins from **{user.name}**.", ephemeral=True
+    )
 
 
 @tree.command(name="resetbalance", description="Reset a user's balance to 10,000 coins")
@@ -391,7 +529,9 @@ async def resetbalance(interaction: discord.Interaction, user: discord.Member):
     data = load_db()
     get_user(data, user.id)["coins"] = 10000
     save_db(data)
-    await interaction.response.send_message(f"✅ Reset **{user.name}**'s balance to 10,000 coins.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Reset **{user.name}**'s balance to **10,000** coins.", ephemeral=True
+    )
 
 
 @tree.command(name="userinfo", description="View a user's coins, wins and total bets")
@@ -399,13 +539,12 @@ async def userinfo(interaction: discord.Interaction, user: discord.Member):
     if not is_admin(interaction.user.id):
         return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
     u = get_user(load_db(), user.id)
-    await interaction.response.send_message(
-        f"👤 **{user.name}**\n"
-        f"💰 Coins: {u['coins']}\n"
-        f"🏆 Wins: {u['wins']}\n"
-        f"🎯 Total Bets: {u['bets']}",
-        ephemeral=True
-    )
+    embed = discord.Embed(title=f"👤 {user.name}", color=discord.Color.blue())
+    embed.add_field(name="💰 Coins", value=u['coins'], inline=True)
+    embed.add_field(name="🏆 Wins", value=u['wins'], inline=True)
+    embed.add_field(name="🎯 Total Bets", value=u['bets'], inline=True)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="banuser", description="Ban a user from placing bets")
@@ -442,23 +581,29 @@ async def stats(interaction: discord.Interaction):
     total_users = len(data["users"])
     total_bets = sum(len(b) for b in data["bets"].values())
     total_matches = len(data["matches"])
+    done_matches = sum(1 for m in data["matches"].values() if m["status"] == "done")
     total_coins = sum(u["coins"] for u in data["users"].values())
-    await interaction.response.send_message(
-        f"📊 **Server Stats**\n"
-        f"👥 Users: {total_users}\n"
-        f"🎯 Total Bets: {total_bets}\n"
-        f"🏏 Matches Tracked: {total_matches}\n"
-        f"💰 Coins in Circulation: {total_coins}",
-        ephemeral=True
-    )
+    embed = discord.Embed(title="📊 Server Stats", color=discord.Color.gold())
+    embed.add_field(name="👥 Users", value=total_users, inline=True)
+    embed.add_field(name="🎯 Total Bets", value=total_bets, inline=True)
+    embed.add_field(name="🏏 Matches Tracked", value=total_matches, inline=True)
+    embed.add_field(name="✅ Completed Matches", value=done_matches, inline=True)
+    embed.add_field(name="💰 Coins in Circulation", value=total_coins, inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="setannouncement", description="Post an announcement to the bot channel")
 async def announce(interaction: discord.Interaction, message: str):
     if not is_admin(interaction.user.id):
         return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-    await client.get_channel(CHANNEL_ID).send(f"📢 {message}")
+    embed = discord.Embed(
+        title="📢 Announcement",
+        description=message,
+        color=discord.Color.red()
+    )
+    await client.get_channel(CHANNEL_ID).send(embed=embed)
     await interaction.response.send_message("✅ Announcement sent.", ephemeral=True)
+
 
 # ===== READY =====
 @client.event
@@ -466,17 +611,15 @@ async def on_ready():
     print(f"Logged in as {client.user}")
     print(f"Commands in tree: {len(tree.get_commands())}")
     try:
-        # Try global sync instead of guild sync
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands globally")
+        synced = await tree.sync(guild=discord.Object(id=1459211477268299938))
+        print(f"Synced {len(synced)} commands:")
         for cmd in synced:
             print(f"  ✅ /{cmd.name}")
-    except discord.errors.HTTPException as e:
-        print(f"HTTP {e.status}: {e.code} - {e.text}")
     except Exception as e:
-        print(f"ERROR: {type(e).__name__}: {e}")
+        print(f"SYNC ERROR: {e}")
     client.loop.create_task(scheduler())
     client.loop.create_task(result_loop())
+
 
 # ===== RUN =====
 keep_alive()
