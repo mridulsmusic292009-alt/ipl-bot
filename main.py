@@ -687,11 +687,11 @@ async def on_ready():
     print(f"Logged in as {client.user}")
     print("RUNNING FILE:", __file__)
     print("ALL COMMANDS:", [cmd.name for cmd in tree.get_commands()])
+
     try:
         GUILD_ID = 1459211477268299938
-synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
-print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
-
+        synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
+        print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
         for cmd in synced:
             print(f"  /{cmd.name}")
     except Exception as e:
