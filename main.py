@@ -688,8 +688,10 @@ async def on_ready():
     print("RUNNING FILE:", __file__)
     print("ALL COMMANDS:", [cmd.name for cmd in tree.get_commands()])
     try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands globally")
+        GUILD_ID = 1459211477268299938
+synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
+print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+
         for cmd in synced:
             print(f"  /{cmd.name}")
     except Exception as e:
