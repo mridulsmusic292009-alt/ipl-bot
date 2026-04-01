@@ -312,9 +312,8 @@ def fetch_ipl_matches():
             return []
 
         all_matches = r.get("data", [])
-        ipl_only = [m for m in all_matches if is_ipl_match(m)]
-        print(f"[API] {len(all_matches)} total matches fetched - {len(ipl_only)} IPL")
-        return ipl_only
+        print(f"[API] {len(all_matches)} total matches fetched")
+        return all_matches
 
     except Exception as e:
         print(f"[API ERROR] {e}")
