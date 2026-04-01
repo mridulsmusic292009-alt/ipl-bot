@@ -18,6 +18,10 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 IST = pytz.timezone("Asia/Kolkata")
 
+DATA_DIR = "/app/data"
+DATABASE_FILE = os.path.join(DATA_DIR, "database.json")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # ===== DISCORD =====
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -25,14 +29,14 @@ tree = app_commands.CommandTree(client)
 
 # ===== DATABASE =====
 def load_db():
-    if not os.path.exists("database.json"):
-        with open("database.json", "w") as f:
+    if not os.path.exists(DATABASE_FILE):
+        with open(DATABASE_FILE, "w") as f:
             json.dump({"users": {}, "bets": {}, "matches": {}, "banned_users": []}, f)
-    with open("database.json", "r") as f:
+    with open(DATABASE_FILE, "r") as f:
         return json.load(f)
 
 def save_db(data):
-    with open("database.json", "w") as f:
+    with open(DATABASE_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
 def get_user(data, uid):
