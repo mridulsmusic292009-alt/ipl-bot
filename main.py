@@ -18,6 +18,9 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 IST = pytz.timezone("Asia/Kolkata")
 
+# ===== SPECIAL PERMISSIONS =====
+BET_BYPASS_USERS = {1365616136300793987}
+
 # ===== PERSISTENT STORAGE =====
 DATA_DIR = "/app/data"
 DATABASE_FILE = os.path.join(DATA_DIR, "database.json")
@@ -55,9 +58,16 @@ def is_admin(uid):
 def is_banned(data, uid):
     return str(uid) in data.get("banned_users", [])
 
-def is_betting_open(match):
+def can_bet_anytime(uid):
+    return uid in BET_BYPASS_USERS
+
+def is_betting_open(match, uid=None):
     if match.get("status") != "upcoming":
         return False
+
+    if uid is not None and can_bet_anytime(uid):
+        return True
+
     mt = datetime.fromisoformat(match["time"])
     if mt.tzinfo is None:
         mt = IST.localize(mt)
@@ -181,7 +191,7 @@ class ConfirmView(discord.ui.View):
         if is_banned(data, interaction.user.id):
             return await interaction.response.edit_message(content="You are banned.", view=None)
 
-        if not is_betting_open(data["matches"].get(self.mid, {})):
+        if not is_betting_open(data["matches"].get(self.mid, {}), interaction.user.id):
             return await interaction.response.edit_message(content="Betting is closed.", view=None)
 
         if has_already_bet(data, self.mid, interaction.user.id):
@@ -228,7 +238,7 @@ class BetModal(discord.ui.Modal, title="Place Your Bet"):
         if is_banned(data, interaction.user.id):
             return await interaction.response.send_message("You are banned.", ephemeral=True)
 
-        if not is_betting_open(data["matches"].get(self.mid, {})):
+        if not is_betting_open(data["matches"].get(self.mid, {}), interaction.user.id):
             return await interaction.response.send_message("Betting is closed.", ephemeral=True)
 
         if has_already_bet(data, self.mid, interaction.user.id):
@@ -268,7 +278,7 @@ class BetView(discord.ui.View):
     @discord.ui.button(label="Team 1", style=discord.ButtonStyle.primary)
     async def b1(self, interaction: discord.Interaction, btn: discord.ui.Button):
         data = load_db()
-        if not is_betting_open(data["matches"].get(self.mid, {})):
+        if not is_betting_open(data["matches"].get(self.mid, {}), interaction.user.id):
             return await interaction.response.send_message("Betting is closed.", ephemeral=True)
         if has_already_bet(data, self.mid, interaction.user.id):
             return await interaction.response.send_message("You already bet on this match.", ephemeral=True)
@@ -277,7 +287,7 @@ class BetView(discord.ui.View):
     @discord.ui.button(label="Team 2", style=discord.ButtonStyle.success)
     async def b2(self, interaction: discord.Interaction, btn: discord.ui.Button):
         data = load_db()
-        if not is_betting_open(data["matches"].get(self.mid, {})):
+        if not is_betting_open(data["matches"].get(self.mid, {}), interaction.user.id):
             return await interaction.response.send_message("Betting is closed.", ephemeral=True)
         if has_already_bet(data, self.mid, interaction.user.id):
             return await interaction.response.send_message("You already bet on this match.", ephemeral=True)
@@ -470,8 +480,9 @@ async def process_results(force=False, match_id=None):
 
         ok, _ = await finalize_match_result(mid, winner, source="api")
         if ok:
-            total_bets = len(load_db()["bets"].get(mid, []))
-            winners_paid = sum(1 for b in load_db()["bets"].get(mid, []) if b["team"] == winner)
+            db = load_db()
+            total_bets = len(db["bets"].get(mid, []))
+            winners_paid = sum(1 for b in db["bets"].get(mid, []) if b["team"] == winner)
             posted_matches.append((mid, winner, winners_paid, total_bets))
 
     return {
@@ -690,7 +701,7 @@ async def matchbets(interaction: discord.Interaction, match_id: str = None):
     data = load_db()
 
     if not match_id:
-        for idx, (d, t1, t2, tm) in enumerate(get_schedule()):
+        for idx, _ in enumerate(get_schedule()):
             ensure_match_exists(data, f"M{idx}")
         data = load_db()
 
