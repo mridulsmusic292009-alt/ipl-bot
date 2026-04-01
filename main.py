@@ -18,6 +18,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 IST = pytz.timezone("Asia/Kolkata")
 
+# ===== PERSISTENT STORAGE =====
 DATA_DIR = "/app/data"
 DATABASE_FILE = os.path.join(DATA_DIR, "database.json")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -26,6 +27,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+scheduler_task = None
+result_task = None
 
 # ===== DATABASE =====
 def load_db():
@@ -85,13 +89,6 @@ def normalize_team(name):
         return None
     return TEAM_MAP.get(name.strip(), name.strip())
 
-def is_ipl_match(match):
-    for field in [match.get("name", ""), match.get("series", ""), match.get("seriesName", "")]:
-        f = field.lower()
-        if "indian premier league" in f or "ipl" in f:
-            return True
-    return False
-
 # ===== KEEP ALIVE =====
 app = Flask("")
 
@@ -133,6 +130,41 @@ def get_schedule():
         ("2026-04-18", "SRH", "CSK", "19:30"),
         ("2026-04-19", "KKR", "RR", "15:30"),
     ]
+
+def ensure_match_exists(data, match_id):
+    if match_id in data["matches"]:
+        return data["matches"][match_id]
+
+    if not match_id or not match_id.startswith("M"):
+        return None
+
+    try:
+        idx = int(match_id[1:])
+    except ValueError:
+        return None
+
+    schedule = get_schedule()
+    if idx < 0 or idx >= len(schedule):
+        return None
+
+    d, t1, t2, tm = schedule[idx]
+    mt = IST.localize(datetime.strptime(f"{d} {tm}", "%Y-%m-%d %H:%M"))
+
+    data["matches"][match_id] = {
+        "team1": t1,
+        "team2": t2,
+        "time": mt.isoformat(),
+        "status": "upcoming",
+        "winner": None
+    }
+    save_db(data)
+    return data["matches"][match_id]
+
+def format_match_line(mid, match):
+    mt = datetime.fromisoformat(match["time"])
+    if mt.tzinfo is None:
+        mt = IST.localize(mt)
+    return f"{mid} - {match['team1']} vs {match['team2']} ({mt.strftime('%b %d, %I:%M %p IST')})"
 
 # ===== BET UI =====
 class ConfirmView(discord.ui.View):
@@ -230,8 +262,8 @@ class BetView(discord.ui.View):
         self.mid = mid
         self.t1 = t1
         self.t2 = t2
-        self.children[0].label = f"{t1}"
-        self.children[1].label = f"{t2}"
+        self.children[0].label = t1
+        self.children[1].label = t2
 
     @discord.ui.button(label="Team 1", style=discord.ButtonStyle.primary)
     async def b1(self, interaction: discord.Interaction, btn: discord.ui.Button):
@@ -290,7 +322,9 @@ async def scheduler():
                         text=f"Betting closes {deadline.strftime('%I:%M %p IST')} | 1 bet per user"
                     )
 
-                    await ch.send(embed=embed, view=BetView(mid, t1, t2))
+                    if ch:
+                        await ch.send(embed=embed, view=BetView(mid, t1, t2))
+
                     data["matches"][mid] = {
                         "team1": t1,
                         "team2": t2,
@@ -304,7 +338,7 @@ async def scheduler():
         await discord.utils.sleep_until(now + timedelta(minutes=5))
 
 # ===== RESULT SYSTEM =====
-def fetch_ipl_matches():
+def fetch_matches_from_api():
     try:
         r = requests.get(
             f"https://api.cricapi.com/v1/matches?apikey={CRICKET_API_KEY}",
@@ -323,8 +357,8 @@ def fetch_ipl_matches():
         print(f"[API ERROR] {e}")
         return []
 
-def find_winner(ipl_data, t1, t2):
-    for m in ipl_data:
+def find_winner(api_data, t1, t2):
+    for m in api_data:
         api_teams = [normalize_team(t) for t in m.get("teams", [])]
         if t1 in api_teams and t2 in api_teams:
             raw = m.get("winner", "")
@@ -332,19 +366,67 @@ def find_winner(ipl_data, t1, t2):
             if raw and raw.strip():
                 return normalize_team(raw)
             return None
-    print(f"[RESULT] {t1} vs {t2} not in IPL data yet")
+    print(f"[RESULT] {t1} vs {t2} not found in API data yet")
     return None
 
-def format_match_line(mid, match):
-    mt = datetime.fromisoformat(match["time"])
-    if mt.tzinfo is None:
-        mt = IST.localize(mt)
-    return f"{mid} - {match['team1']} vs {match['team2']} ({mt.strftime('%b %d, %I:%M %p IST')})"
+async def finalize_match_result(mid, winner, source="manual"):
+    data = load_db()
+    ch = client.get_channel(CHANNEL_ID)
+    m = data["matches"].get(mid)
+
+    if not m:
+        return False, "Match not found."
+
+    if m["status"] == "done":
+        return False, "Match is already completed."
+
+    winners = []
+    for b in data["bets"].get(mid, []):
+        u = get_user(data, b["user"])
+        if b["team"] == winner:
+            coins = b["amount"] * 2
+            u["coins"] += coins
+            u["wins"] += 1
+            winners.append((b["user"], coins))
+
+    winners.sort(key=lambda x: x[1], reverse=True)
+    total_bets = len(data["bets"].get(mid, []))
+
+    embed = discord.Embed(
+        title="Match Result",
+        description=f"**{m['team1']}** vs **{m['team2']}**",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Winner", value=f"**{winner}**", inline=True)
+    embed.add_field(name="Total Bets", value=str(total_bets), inline=True)
+    embed.add_field(name="Declared By", value=source.title(), inline=True)
+
+    if winners:
+        top = ""
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, (uid, amt) in enumerate(winners[:3]):
+            top += f"{medals[idx]} <@{uid}> +**{amt}** coins\n"
+        embed.add_field(name="Top Winners", value=top, inline=False)
+        embed.set_footer(text=f"All {len(winners)} winner(s) paid 2x | {total_bets - len(winners)} lost their bet")
+    else:
+        embed.add_field(name="No Winners", value="Nobody bet on the winning team.", inline=False)
+
+    if ch:
+        await ch.send(embed=embed)
+
+    m["status"] = "done"
+    m["winner"] = winner
+    save_db(data)
+    print(f"[RESULT] Winner posted: {winner} ({source})")
+    return True, f"Winner set to {winner}."
 
 async def process_results(force=False, match_id=None):
     data = load_db()
-    ch = client.get_channel(CHANNEL_ID)
     now = datetime.now(IST)
+
+    if match_id:
+        ensure_match_exists(data, match_id)
+        data = load_db()
 
     pending = []
     skipped = []
@@ -368,7 +450,6 @@ async def process_results(force=False, match_id=None):
             continue
 
         if force or (mt + timedelta(hours=4) <= now <= mt + timedelta(hours=7)):
-
             pending.append((mid, m))
         else:
             skipped.append((mid, "Result window has not opened yet"))
@@ -377,56 +458,21 @@ async def process_results(force=False, match_id=None):
         return {"checked": 0, "posted": 0, "posted_matches": [], "skipped": skipped}
 
     print(f"[RESULT] {len(pending)} match(es) to check - making 1 API call")
-    ipl_data = fetch_ipl_matches()
+    api_data = fetch_matches_from_api()
     posted_matches = []
 
     for mid, m in pending:
-        winner = find_winner(ipl_data, m["team1"], m["team2"])
+        winner = find_winner(api_data, m["team1"], m["team2"])
 
         if not winner:
             print(f"[RESULT] No winner yet for {m['team1']} vs {m['team2']}")
             continue
 
-        winners = []
-        for b in data["bets"].get(mid, []):
-            u = get_user(data, b["user"])
-            if b["team"] == winner:
-                coins = b["amount"] * 2
-                u["coins"] += coins
-                u["wins"] += 1
-                winners.append((b["user"], coins))
-
-        winners.sort(key=lambda x: x[1], reverse=True)
-
-        total_bets = len(data["bets"].get(mid, []))
-        embed = discord.Embed(
-            title="Match Result",
-            description=f"**{m['team1']}** vs **{m['team2']}**",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="Winner", value=f"**{winner}**", inline=True)
-        embed.add_field(name="Total Bets", value=str(total_bets), inline=True)
-
-        if winners:
-            top = ""
-            medals = ["🥇", "🥈", "🥉"]
-            for idx, (uid, amt) in enumerate(winners[:3]):
-                top += f"{medals[idx]} <@{uid}> +**{amt}** coins\n"
-            embed.add_field(name="Top Winners", value=top, inline=False)
-            embed.set_footer(
-                text=f"All {len(winners)} winner(s) paid 2x | {total_bets - len(winners)} lost their bet"
-            )
-        else:
-            embed.add_field(name="No Winners", value="Nobody bet on the winning team.", inline=False)
-
-        if ch:
-            await ch.send(embed=embed)
-
-        m["status"] = "done"
-        m["winner"] = winner
-        save_db(data)
-        posted_matches.append((mid, winner, len(winners), total_bets))
-        print(f"[RESULT] Winner posted: {winner}")
+        ok, _ = await finalize_match_result(mid, winner, source="api")
+        if ok:
+            total_bets = len(load_db()["bets"].get(mid, []))
+            winners_paid = sum(1 for b in load_db()["bets"].get(mid, []) if b["team"] == winner)
+            posted_matches.append((mid, winner, winners_paid, total_bets))
 
     return {
         "checked": len(pending),
@@ -505,7 +551,8 @@ async def help_cmd(interaction: discord.Interaction):
             "`/stats` - Server-wide stats\n"
             "`/setannouncement message` - Post an announcement\n"
             "`/checkresult [match_id]` - Force a result check\n"
-            "`/matchbets [match_id]` - View who bet how much"
+            "`/matchbets [match_id]` - View who bet how much\n"
+            "`/setwinner match_id winner` - Manually declare a winner"
         ),
         inline=False
     )
@@ -605,12 +652,14 @@ async def checkresult(interaction: discord.Interaction, match_id: str = None):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
 
     data = load_db()
-    if match_id and match_id not in data["matches"]:
-        available = "\n".join(format_match_line(mid, match) for mid, match in sorted(data["matches"].items()))
-        return await interaction.response.send_message(
-            f"Match ID not found.\n\nAvailable matches:\n{available or 'No matches found.'}",
-            ephemeral=True
-        )
+    if match_id:
+        match = ensure_match_exists(data, match_id)
+        if not match:
+            available = "\n".join(format_match_line(mid, m) for mid, m in sorted(data["matches"].items()))
+            return await interaction.response.send_message(
+                f"Match ID not found.\n\nAvailable matches:\n{available or 'No matches found.'}",
+                ephemeral=True
+            )
 
     await interaction.response.defer(ephemeral=True)
     result = await process_results(force=True, match_id=match_id)
@@ -640,6 +689,11 @@ async def matchbets(interaction: discord.Interaction, match_id: str = None):
 
     data = load_db()
 
+    if not match_id:
+        for idx, (d, t1, t2, tm) in enumerate(get_schedule()):
+            ensure_match_exists(data, f"M{idx}")
+        data = load_db()
+
     if not data["matches"]:
         return await interaction.response.send_message("No matches have been posted yet.", ephemeral=True)
 
@@ -650,14 +704,15 @@ async def matchbets(interaction: discord.Interaction, match_id: str = None):
             ephemeral=True
         )
 
-    match = data["matches"].get(match_id)
+    match = ensure_match_exists(data, match_id)
     if not match:
         available = "\n".join(format_match_line(mid, m) for mid, m in sorted(data["matches"].items()))
         return await interaction.response.send_message(
-            f"Match ID not found.\n\nAvailable matches:\n{available}",
+            f"Match ID not found.\n\nAvailable matches:\n{available or 'No matches found.'}",
             ephemeral=True
         )
 
+    data = load_db()
     bets = data["bets"].get(match_id, [])
     title = f"{match_id} - {match['team1']} vs {match['team2']}"
 
@@ -677,37 +732,68 @@ async def matchbets(interaction: discord.Interaction, match_id: str = None):
     )
     await interaction.response.send_message(message[:1900], ephemeral=True)
 
+@tree.command(name="setwinner", description="Manually declare the winner of a match")
+async def setwinner(interaction: discord.Interaction, match_id: str, winner: str):
+    if not is_admin(interaction.user.id):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    data = load_db()
+    match = ensure_match_exists(data, match_id)
+    if not match:
+        return await interaction.response.send_message("Match ID not found.", ephemeral=True)
+
+    winner = winner.strip().upper()
+    valid = {
+        match["team1"].upper(): match["team1"],
+        match["team2"].upper(): match["team2"]
+    }
+
+    if winner not in valid:
+        return await interaction.response.send_message(
+            f"Winner must be `{match['team1']}` or `{match['team2']}`.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    ok, msg = await finalize_match_result(match_id, valid[winner], source="manual")
+    await interaction.followup.send(msg, ephemeral=True)
+
 @tree.command(name="setannouncement", description="Post an announcement to the bot channel")
 async def announce(interaction: discord.Interaction, message: str):
     if not is_admin(interaction.user.id):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
     embed = discord.Embed(title="Announcement", description=message, color=discord.Color.red())
-    await client.get_channel(CHANNEL_ID).send(embed=embed)
+    ch = client.get_channel(CHANNEL_ID)
+    if ch:
+        await ch.send(embed=embed)
     await interaction.response.send_message("Sent.", ephemeral=True)
 
 # ===== READY =====
 @client.event
 async def on_ready():
+    global scheduler_task, result_task
+
     print(f"Logged in as {client.user}")
     print("RUNNING FILE:", __file__)
+    print("DB FILE:", DATABASE_FILE)
     print("ALL COMMANDS:", [cmd.name for cmd in tree.get_commands()])
 
     try:
         GUILD_ID = 1459211477268299938
         guild = discord.Object(id=GUILD_ID)
-
         tree.copy_global_to(guild=guild)
         synced = await tree.sync(guild=guild)
-
         print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
         for cmd in synced:
             print(f"  /{cmd.name}")
     except Exception as e:
         print(f"SYNC ERROR: {e}")
 
-    client.loop.create_task(scheduler())
-    client.loop.create_task(result_loop())
+    if scheduler_task is None or scheduler_task.done():
+        scheduler_task = client.loop.create_task(scheduler())
 
+    if result_task is None or result_task.done():
+        result_task = client.loop.create_task(result_loop())
 
 # ===== RUN =====
 keep_alive()
