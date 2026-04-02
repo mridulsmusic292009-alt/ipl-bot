@@ -306,7 +306,7 @@ async def scheduler():
             mt = IST.localize(datetime.strptime(f"{d} {tm}", "%Y-%m-%d %H:%M"))
             mid = f"M{idx}"
 
-            if mt - timedelta(hours=3) <= now <= mt - timedelta(hours=2, minutes=55):
+            if mt - timedelta(hours=4) <= now <= mt - timedelta(hours=3, minutes=55):
                 if mid not in data["matches"]:
                     day_matches = [x for x in schedule if x[0] == d]
                     match_num = next(i + 1 for i, x in enumerate(day_matches) if x[1] == t1 and x[2] == t2)
