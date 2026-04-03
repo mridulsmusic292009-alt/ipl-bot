@@ -29,6 +29,12 @@ DATA_DIR = "/app/data"
 DATABASE_FILE = os.path.join(DATA_DIR, "database.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Debug startup
+print(f"[STARTUP] DATA_DIR: {DATA_DIR}")
+print(f"[STARTUP] DATA_DIR EXISTS: {os.path.exists(DATA_DIR)}")
+print(f"[STARTUP] DATA_DIR WRITABLE: {os.access(DATA_DIR, os.W_OK)}")
+print(f"[STARTUP] DATABASE_FILE: {DATABASE_FILE}")
+
 # ===== DISCORD =====
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -50,6 +56,13 @@ def default_db():
     }
 
 def load_db():
+    print(f"[DB] Loading from: {DATABASE_FILE}")
+    print(f"[DB] File exists: {os.path.exists(DATABASE_FILE)}")
+
+    if os.path.exists(DATABASE_FILE):
+        size = os.path.getsize(DATABASE_FILE)
+        print(f"[DB] File size: {size} bytes")
+
     if not os.path.exists(DATABASE_FILE):
         with open(DATABASE_FILE, "w") as f:
             json.dump(default_db(), f, indent=4)
@@ -67,8 +80,11 @@ def load_db():
     return data
 
 def save_db(data):
+    print(f"[DB] Saving to: {DATABASE_FILE}")
     with open(DATABASE_FILE, "w") as f:
         json.dump(data, f, indent=4)
+    size = os.path.getsize(DATABASE_FILE)
+    print(f"[DB] Saved successfully. File size: {size} bytes")
 
 def get_user(data, uid):
     uid = str(uid)
