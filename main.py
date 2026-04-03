@@ -931,6 +931,59 @@ async def setwinner(interaction: discord.Interaction, match_id: str, winner: str
     ok, msg = await finalize_match_result(match_id, valid[winner], source="manual")
     await interaction.followup.send(msg, ephemeral=True)
 
+@tree.command(name="postmatch", description="Manually post a scheduled match by match ID")
+async def postmatch(interaction: discord.Interaction, match_id: str):
+    if not is_admin(interaction.user.id):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    data = load_db()
+    match = ensure_match_exists(data, match_id)
+    if not match:
+        return await interaction.response.send_message("Match ID not found.", ephemeral=True)
+
+    mt = datetime.fromisoformat(match["time"])
+    if mt.tzinfo is None:
+        mt = IST.localize(mt)
+
+    schedule = get_schedule()
+    try:
+        idx = int(match_id[1:])
+    except ValueError:
+        return await interaction.response.send_message("Invalid match ID.", ephemeral=True)
+
+    if idx < 0 or idx >= len(schedule):
+        return await interaction.response.send_message("Invalid match ID.", ephemeral=True)
+
+    d, t1, t2, tm = schedule[idx]
+    day_matches = [x for x in schedule if x[0] == d]
+    match_num = next(i + 1 for i, x in enumerate(day_matches) if x[1] == t1 and x[2] == t2)
+    total_day = len(day_matches)
+    deadline = mt + timedelta(minutes=15)
+
+    embed = discord.Embed(
+        title=f"IPL 2026 - Match #{idx + 1}",
+        description=f"**{t1} vs {t2}**",
+        color=discord.Color.orange()
+    )
+    embed.add_field(
+        name="Date",
+        value=datetime.strptime(d, "%Y-%m-%d").strftime("%B %d, %Y"),
+        inline=True
+    )
+    embed.add_field(name="Starts", value=mt.strftime("%I:%M %p IST"), inline=True)
+    embed.add_field(name="Bet", value="Min 1 coin - max all your coins", inline=True)
+    if total_day == 2:
+        embed.add_field(name="Today", value=f"Match {match_num} of 2", inline=True)
+    embed.add_field(name="Payout", value="Win = **2x** your bet", inline=True)
+    embed.set_footer(text=f"Betting closes {deadline.strftime('%I:%M %p IST')} | 1 bet per user")
+
+    ch = client.get_channel(CHANNEL_ID)
+    if not ch:
+        return await interaction.response.send_message("Channel not found.", ephemeral=True)
+
+    await ch.send(embed=embed, view=BetView(match_id, t1, t2))
+    await interaction.response.send_message(f"Posted **{match_id}**: {t1} vs {t2}", ephemeral=True)
+
 @tree.command(name="setannouncement", description="Post an announcement to the bot channel")
 async def announce(interaction: discord.Interaction, message: str):
     if not is_admin(interaction.user.id):
