@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord import app_commands
 import json
@@ -15,11 +16,13 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CRICKET_API_KEY = os.getenv("CRICKET_API_KEY")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+GUILD_ID = int(os.getenv("GUILD_ID", "1459211477268299938"))
 
 IST = pytz.timezone("Asia/Kolkata")
 
 # ===== SPECIAL PERMISSIONS =====
 BET_BYPASS_USERS = {1365616136300793987}
+SETWINNER_AUTH_USERS = {ADMIN_ID, 1365616136300793987}
 
 # ===== PERSISTENT STORAGE =====
 DATA_DIR = "/app/data"
@@ -28,6 +31,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # ===== DISCORD =====
 intents = discord.Intents.default()
+intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -35,12 +39,33 @@ scheduler_task = None
 result_task = None
 
 # ===== DATABASE =====
+def default_db():
+    return {
+        "users": {},
+        "bets": {},
+        "matches": {},
+        "banned_users": [],
+        "meta": {
+            "summary_posted_dates": []
+        }
+    }
+
 def load_db():
     if not os.path.exists(DATABASE_FILE):
         with open(DATABASE_FILE, "w") as f:
-            json.dump({"users": {}, "bets": {}, "matches": {}, "banned_users": []}, f)
+            json.dump(default_db(), f, indent=4)
+
     with open(DATABASE_FILE, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+
+    data.setdefault("users", {})
+    data.setdefault("bets", {})
+    data.setdefault("matches", {})
+    data.setdefault("banned_users", [])
+    data.setdefault("meta", {})
+    data["meta"].setdefault("summary_posted_dates", [])
+
+    return data
 
 def save_db(data):
     with open(DATABASE_FILE, "w") as f:
@@ -54,6 +79,9 @@ def get_user(data, uid):
 
 def is_admin(uid):
     return uid == ADMIN_ID
+
+def can_set_winner(uid):
+    return uid in SETWINNER_AUTH_USERS
 
 def is_banned(data, uid):
     return str(uid) in data.get("banned_users", [])
@@ -71,6 +99,7 @@ def is_betting_open(match, uid=None):
     mt = datetime.fromisoformat(match["time"])
     if mt.tzinfo is None:
         mt = IST.localize(mt)
+
     return datetime.now(IST) < mt + timedelta(minutes=15)
 
 def has_already_bet(data, mid, uid):
@@ -112,7 +141,7 @@ def run():
 def keep_alive():
     Thread(target=run).start()
 
-# ===== MATCH SCHEDULE =====
+# ===== MATCH SCHEDULE (APR 1 - APR 29, 2026) =====
 def get_schedule():
     return [
         ("2026-04-01", "LSG", "DC", "19:30"),
@@ -139,6 +168,19 @@ def get_schedule():
         ("2026-04-18", "RCB", "DC", "15:30"),
         ("2026-04-18", "SRH", "CSK", "19:30"),
         ("2026-04-19", "KKR", "RR", "15:30"),
+        ("2026-04-19", "PBKS", "LSG", "19:30"),
+        ("2026-04-20", "GT", "MI", "19:30"),
+        ("2026-04-21", "SRH", "DC", "19:30"),
+        ("2026-04-22", "LSG", "RR", "19:30"),
+        ("2026-04-23", "MI", "CSK", "19:30"),
+        ("2026-04-24", "RCB", "GT", "19:30"),
+        ("2026-04-25", "DC", "PBKS", "15:30"),
+        ("2026-04-25", "RR", "SRH", "19:30"),
+        ("2026-04-26", "GT", "CSK", "15:30"),
+        ("2026-04-26", "LSG", "KKR", "19:30"),
+        ("2026-04-27", "DC", "RCB", "19:30"),
+        ("2026-04-28", "PBKS", "RR", "19:30"),
+        ("2026-04-29", "MI", "SRH", "19:30"),
     ]
 
 def ensure_match_exists(data, match_id):
@@ -175,6 +217,12 @@ def format_match_line(mid, match):
     if mt.tzinfo is None:
         mt = IST.localize(mt)
     return f"{mid} - {match['team1']} vs {match['team2']} ({mt.strftime('%b %d, %I:%M %p IST')})"
+
+def get_match_id_for_date_teams(date_str, t1, t2):
+    for idx, (d, a, b, _) in enumerate(get_schedule()):
+        if d == date_str and a == t1 and b == t2:
+            return f"M{idx}"
+    return None
 
 # ===== BET UI =====
 class ConfirmView(discord.ui.View):
@@ -306,6 +354,7 @@ async def scheduler():
             mt = IST.localize(datetime.strptime(f"{d} {tm}", "%Y-%m-%d %H:%M"))
             mid = f"M{idx}"
 
+            # Post 4 hours before start for all days
             if mt - timedelta(hours=4) <= now <= mt - timedelta(hours=3, minutes=55):
                 if mid not in data["matches"]:
                     day_matches = [x for x in schedule if x[0] == d]
@@ -328,9 +377,7 @@ async def scheduler():
                     if total_day == 2:
                         embed.add_field(name="Today", value=f"Match {match_num} of 2", inline=True)
                     embed.add_field(name="Payout", value="Win = **2x** your bet", inline=True)
-                    embed.set_footer(
-                        text=f"Betting closes {deadline.strftime('%I:%M %p IST')} | 1 bet per user"
-                    )
+                    embed.set_footer(text=f"Betting closes {deadline.strftime('%I:%M %p IST')} | 1 bet per user")
 
                     if ch:
                         await ch.send(embed=embed, view=BetView(mid, t1, t2))
@@ -378,6 +425,52 @@ def find_winner(api_data, t1, t2):
             return None
     print(f"[RESULT] {t1} vs {t2} not found in API data yet")
     return None
+
+async def post_set1_summary_once(target_date="2026-04-29"):
+    data = load_db()
+    if target_date in data["meta"]["summary_posted_dates"]:
+        return
+
+    await asyncio.sleep(600)
+
+    data = load_db()
+    if target_date in data["meta"]["summary_posted_dates"]:
+        return
+
+    ch = client.get_channel(CHANNEL_ID)
+    if not ch:
+        return
+
+    top_users = sorted(
+        data["users"].items(),
+        key=lambda x: (x[1]["coins"], x[1]["wins"], x[1]["bets"]),
+        reverse=True
+    )[:15]
+
+    if not top_users:
+        return
+
+    lines = []
+    for idx, (uid, u) in enumerate(top_users, start=1):
+        lines.append(
+            f"{idx}. <@{uid}> | Coins: **{u['coins']}** | Wins: **{u['wins']}** | Bets: **{u['bets']}**"
+        )
+
+    embed = discord.Embed(
+        title="Set 1 Final Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="Posted 10 minutes after the last April 29 result")
+
+    await ch.send(
+        content="@everyone Set 1 has ended. Here is the final top 15 leaderboard.",
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(everyone=True)
+    )
+
+    data["meta"]["summary_posted_dates"].append(target_date)
+    save_db(data)
 
 async def finalize_match_result(mid, winner, source="manual"):
     data = load_db()
@@ -428,6 +521,14 @@ async def finalize_match_result(mid, winner, source="manual"):
     m["winner"] = winner
     save_db(data)
     print(f"[RESULT] Winner posted: {winner} ({source})")
+
+    mt = datetime.fromisoformat(m["time"])
+    result_date = mt.date().isoformat()
+    if result_date == "2026-04-29":
+        data = load_db()
+        if "2026-04-29" not in data["meta"]["summary_posted_dates"]:
+            client.loop.create_task(post_set1_summary_once("2026-04-29"))
+
     return True, f"Winner set to {winner}."
 
 async def process_results(force=False, match_id=None):
@@ -504,14 +605,15 @@ async def balance(interaction: discord.Interaction):
     u = get_user(load_db(), interaction.user.id)
     await interaction.response.send_message(f"You have **{u['coins']}** coins.", ephemeral=True)
 
-@tree.command(name="leaderboard", description="View the top 3 richest users")
+@tree.command(name="leaderboard", description="View the top 10 richest users")
 async def leaderboard(interaction: discord.Interaction):
     data = load_db()
     users = sorted(data["users"].items(), key=lambda x: x[1]["coins"], reverse=True)
     msg = "**Leaderboard**\n\n"
     medals = ["🥇", "🥈", "🥉"]
-    for idx, (uid, u) in enumerate(users[:3]):
-        msg += f"{medals[idx]} <@{uid}> - **{u['coins']}** coins\n"
+    for idx, (uid, u) in enumerate(users[:10]):
+        marker = medals[idx] if idx < 3 else f"{idx + 1}."
+        msg += f"{marker} <@{uid}> - **{u['coins']}** coins\n"
     await interaction.response.send_message(msg, ephemeral=True)
 
 @tree.command(name="history", description="View your bet history with win/loss status")
@@ -543,7 +645,7 @@ async def help_cmd(interaction: discord.Interaction):
         name="User Commands",
         value=(
             "`/balance` - Check your coin balance\n"
-            "`/leaderboard` - Top 3 richest users\n"
+            "`/leaderboard` - Top richest users\n"
             "`/history` - Your bets with win/loss status\n"
             "`/help` - Show this menu"
         ),
@@ -552,18 +654,20 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Admin Commands",
         value=(
-            "`/setbalance @user amount` - Set a user's coins\n"
-            "`/addbalance @user amount` - Add coins to a user\n"
-            "`/removebalance @user amount` - Remove coins from a user\n"
-            "`/resetbalance @user` - Reset user to 10,000 coins\n"
-            "`/userinfo @user` - View user stats\n"
-            "`/banuser @user` - Ban user from betting\n"
-            "`/unbanuser @user` - Unban a user\n"
-            "`/stats` - Server-wide stats\n"
-            "`/setannouncement message` - Post an announcement\n"
-            "`/checkresult [match_id]` - Force a result check\n"
-            "`/matchbets [match_id]` - View who bet how much\n"
-            "`/setwinner match_id winner` - Manually declare a winner"
+            "`/setbalance @user amount`\n"
+            "`/addbalance @user amount`\n"
+            "`/removebalance @user amount`\n"
+            "`/resetbalance @user`\n"
+            "`/userinfo @user`\n"
+            "`/edituser @user field value`\n"
+            "`/banuser @user`\n"
+            "`/unbanuser @user`\n"
+            "`/stats`\n"
+            "`/checkresult [match_id]`\n"
+            "`/matchbets [match_id]`\n"
+            "`/setwinner match_id winner`\n"
+            "`/totalinfo`\n"
+            "`/setannouncement message`"
         ),
         inline=False
     )
@@ -605,8 +709,24 @@ async def resetbalance(interaction: discord.Interaction, user: discord.Member):
         return await interaction.response.send_message("Admin only.", ephemeral=True)
     data = load_db()
     get_user(data, user.id)["coins"] = 10000
+    get_user(data, user.id)["wins"] = 0
+    get_user(data, user.id)["bets"] = 0
     save_db(data)
-    await interaction.response.send_message(f"Reset **{user.name}** to **10,000** coins.", ephemeral=True)
+    await interaction.response.send_message(f"Reset **{user.name}** to default stats.", ephemeral=True)
+
+@tree.command(name="edituser", description="Edit any user stat: coins, wins, or bets")
+async def edituser(interaction: discord.Interaction, user: discord.Member, field: str, value: int):
+    if not is_admin(interaction.user.id):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    field = field.lower().strip()
+    if field not in {"coins", "wins", "bets"}:
+        return await interaction.response.send_message("Field must be `coins`, `wins`, or `bets`.", ephemeral=True)
+
+    data = load_db()
+    get_user(data, user.id)[field] = value
+    save_db(data)
+    await interaction.response.send_message(f"Set **{user.name}** `{field}` to **{value}**.", ephemeral=True)
 
 @tree.command(name="userinfo", description="View a user's coins, wins and total bets")
 async def userinfo(interaction: discord.Interaction, user: discord.Member):
@@ -619,6 +739,42 @@ async def userinfo(interaction: discord.Interaction, user: discord.Member):
     embed.add_field(name="Total Bets", value=u["bets"], inline=True)
     embed.set_thumbnail(url=user.display_avatar.url)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="totalinfo", description="Show all user data in a table")
+async def totalinfo(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    data = load_db()
+    rows = []
+    for uid, u in sorted(data["users"].items(), key=lambda x: (x[1]["coins"], x[1]["wins"], x[1]["bets"]), reverse=True):
+        member = interaction.guild.get_member(int(uid)) if interaction.guild else None
+        name = member.display_name if member else uid
+        rows.append(f"{name[:16]:16} | {u['coins']:>6} | {u['wins']:>4} | {u['bets']:>4}")
+
+    if not rows:
+        return await interaction.response.send_message("No user data found.", ephemeral=True)
+
+    header = "Name             | Coins | Wins | Bets"
+    divider = "-" * len(header)
+    lines = [header, divider] + rows
+
+    chunks = []
+    current = "```text\n"
+    for line in lines:
+        add = line + "\n"
+        if len(current) + len(add) + 3 > 1900:
+            current += "```"
+            chunks.append(current)
+            current = "```text\n" + add
+        else:
+            current += add
+    current += "```"
+    chunks.append(current)
+
+    await interaction.response.send_message(chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
 
 @tree.command(name="banuser", description="Ban a user from placing bets")
 async def banuser(interaction: discord.Interaction, user: discord.Member):
@@ -730,7 +886,11 @@ async def matchbets(interaction: discord.Interaction, match_id: str = None):
     if not bets:
         return await interaction.response.send_message(f"**{title}**\nNo bets placed yet.", ephemeral=True)
 
+    team1_total = sum(b["amount"] for b in bets if b["team"] == match["team1"])
+    team2_total = sum(b["amount"] for b in bets if b["team"] == match["team2"])
     total_amount = sum(b["amount"] for b in bets)
+    unique_users = len({b["user"] for b in bets})
+
     lines = [
         f"<@{b['user']}> - **{b['team']}** - **{b['amount']}** coins"
         for b in sorted(bets, key=lambda x: x["amount"], reverse=True)
@@ -738,6 +898,9 @@ async def matchbets(interaction: discord.Interaction, match_id: str = None):
     message = (
         f"**{title}**\n"
         f"Total bets: **{len(bets)}**\n"
+        f"Unique members: **{unique_users}**\n"
+        f"{match['team1']} total: **{team1_total}**\n"
+        f"{match['team2']} total: **{team2_total}**\n"
         f"Total amount: **{total_amount}** coins\n\n"
         + "\n".join(lines)
     )
@@ -745,8 +908,8 @@ async def matchbets(interaction: discord.Interaction, match_id: str = None):
 
 @tree.command(name="setwinner", description="Manually declare the winner of a match")
 async def setwinner(interaction: discord.Interaction, match_id: str, winner: str):
-    if not is_admin(interaction.user.id):
-        return await interaction.response.send_message("Admin only.", ephemeral=True)
+    if not can_set_winner(interaction.user.id):
+        return await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
 
     data = load_db()
     match = ensure_match_exists(data, match_id)
@@ -790,7 +953,6 @@ async def on_ready():
     print("ALL COMMANDS:", [cmd.name for cmd in tree.get_commands()])
 
     try:
-        GUILD_ID = 1459211477268299938
         guild = discord.Object(id=GUILD_ID)
         tree.copy_global_to(guild=guild)
         synced = await tree.sync(guild=guild)
