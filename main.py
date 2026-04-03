@@ -25,6 +25,9 @@ BET_BYPASS_USERS = {1365616136300793987}
 DATA_DIR = "/app/data"
 DATABASE_FILE = os.path.join(DATA_DIR, "database.json")
 os.makedirs(DATA_DIR, exist_ok=True)
+print(f"DATA_DIR: {DATA_DIR}")
+print(f"DATA_DIR EXISTS: {os.path.exists(DATA_DIR)}")
+print(f"DATA_DIR IS WRITABLE: {os.access(DATA_DIR, os.W_OK)}")
 
 # ===== DISCORD =====
 intents = discord.Intents.default()
@@ -36,6 +39,10 @@ result_task = None
 
 # ===== DATABASE =====
 def load_db():
+    print(f"DB FILE: {DATABASE_FILE}")
+    print(f"DB EXISTS: {os.path.exists(DATABASE_FILE)}")
+    if os.path.exists(DATABASE_FILE):
+        print(f"DB SIZE: {os.path.getsize(DATABASE_FILE)} bytes")
     if not os.path.exists(DATABASE_FILE):
         with open(DATABASE_FILE, "w") as f:
             json.dump({"users": {}, "bets": {}, "matches": {}, "banned_users": []}, f)
@@ -45,6 +52,8 @@ def load_db():
 def save_db(data):
     with open(DATABASE_FILE, "w") as f:
         json.dump(data, f, indent=4)
+    print(f"DB SAVED: {DATABASE_FILE}")
+    print(f"DB SIZE AFTER SAVE: {os.path.getsize(DATABASE_FILE)} bytes")
 
 def get_user(data, uid):
     uid = str(uid)
