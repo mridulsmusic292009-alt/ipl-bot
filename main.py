@@ -31,7 +31,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # ===== DISCORD =====
 intents = discord.Intents.default()
-intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
